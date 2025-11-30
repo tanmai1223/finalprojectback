@@ -1,7 +1,5 @@
 import logData from "../models/logModel.js";
 
- 
-
 export const postLogs = async (req, res) => {
   try {
     const { traceId, method, endpoint, status, responseTimeMs, logs } = req.body;
@@ -42,9 +40,6 @@ export const postLogs = async (req, res) => {
   }
 };
 
-
-
-
 export const getLogs = async (req, res) => {
   try {
     const data = await logData.find().sort({ "logs.timestamp": -1 });
@@ -59,214 +54,331 @@ export const getLogs = async (req, res) => {
 
 export const getLogsTime = async (req, res) => {
   try {
-    const { year, month } = req.query;
+    let { year, month } = req.query;
 
-    if (!year || !month) {
-      return res.status(400).json({ error: "Please provide year and month" });
+    // Validate incoming query; keep as numbers if present
+    const hasYearMonth = !!year && !!month;
+    if (hasYearMonth) {
+      year = Number(year);
+      month = Number(month);
+      if (Number.isNaN(year) || Number.isNaN(month)) {
+        return res.status(400).json({ error: "Invalid year or month" });
+      }
     }
 
-    const start = new Date(year, month - 1, 1);
-    const end = new Date(year, month, 1);
+    // helper to fetch grouped logs for a start/end range
+    const fetchGrouped = async (start, end) => {
+      const logs = await logData
+        .find({ "logs.timestamp": { $gte: start, $lt: end } })
+        .sort({ "logs.timestamp": 1 })
+        .select("traceId method endpoint status logs.timestamp");
 
-    const logs = await logData
-      .find({ "logs.timestamp": { $gte: start, $lt: end } })
-      .sort({ "logs.timestamp": 1 })
-      .select("traceId method endpoint status logs.timestamp");
+      const grouped = {};
+      logs.forEach((log) => {
+        const filteredLogs = log.logs.filter(
+          (l) => l.timestamp >= start && l.timestamp < end
+        );
 
-    const grouped = {};
+        filteredLogs.forEach((l) => {
+          const baseEndpoint = log.endpoint.split("/").slice(0, 3).join("/");
 
-    logs.forEach((log) => {
-      const filteredLogs = log.logs.filter(
-        (l) => l.timestamp >= start && l.timestamp < end
-      );
+          if (!grouped[baseEndpoint]) grouped[baseEndpoint] = [];
 
-      filteredLogs.forEach((l) => {
-        const baseEndpoint = log.endpoint.split("/").slice(0, 3).join("/");
-
-        if (!grouped[baseEndpoint]) grouped[baseEndpoint] = [];
-
-        grouped[baseEndpoint].push({
-          traceId: log.traceId,
-          method: log.method,
-          endpoint: log.endpoint,
-          status: log.status,
-          timestamp: l.timestamp,
+          grouped[baseEndpoint].push({
+            traceId: log.traceId,
+            method: log.method,
+            endpoint: log.endpoint,
+            status: log.status,
+            timestamp: l.timestamp,
+          });
         });
       });
-    });
-    //console.log(grouped);
-    res.status(200).json({ message: "Grouped logs", data: grouped });
+
+      return grouped;
+    };
+
+    // If user provided year/month, try that month first
+    if (hasYearMonth) {
+      const start = new Date(year, month - 1, 1);
+      const end = new Date(year, month, 1);
+
+      let grouped = await fetchGrouped(start, end);
+
+      // if data found, return it
+      if (Object.keys(grouped).length > 0) {
+        return res
+          .status(200)
+          .json({ message: "Grouped logs", data: grouped, year, month });
+      }
+
+      // otherwise fall through to find latest month with data
+    }
+
+    // No valid requested data (either not provided or empty) -> find latest log timestamp
+    // Use aggregation to get the latest logs.timestamp across the collection
+    const latestAgg = await logData.aggregate([
+      { $unwind: "$logs" },
+      { $sort: { "logs.timestamp": -1 } },
+      { $limit: 1 },
+      { $project: { ts: "$logs.timestamp" } },
+    ]);
+
+    if (!latestAgg || latestAgg.length === 0) {
+      // No logs at all
+      return res
+        .status(200)
+        .json({ message: "No logs available", data: {}, year: null, month: null });
+    }
+
+    const latestTs = new Date(latestAgg[0].ts);
+    const ly = latestTs.getFullYear();
+    const lm = latestTs.getMonth() + 1;
+
+    // Fetch grouped logs for that latest month
+    const latestStart = new Date(ly, lm - 1, 1);
+    const latestEnd = new Date(ly, lm, 1);
+    const groupedLatest = await fetchGrouped(latestStart, latestEnd);
+
+    return res
+      .status(200)
+      .json({ message: "Grouped logs (latest available)", data: groupedLatest, year: ly, month: lm });
   } catch (error) {
+    console.error("getLogsTime error:", error);
     res.status(500).json({ status: "error", message: "Failed to fetch logs" });
   }
 };
 
-export const getAnalysis = async (req, res) => {
-  try {
-    const { year, month } = req.query; // e.g. year=2025, month=09
+const countLogsInRange = async (start, end) => {
+  return await logData.countDocuments({ "logs.timestamp": { $gte: start, $lt: end } });
+};
 
-    if (!year || !month) {
-      return res
-        .status(400)
-        .json({
-          error: "Please provide year and month (e.g. ?year=2025&month=09)",
-        });
-    }
+const computeAnalysisForRange = async (start, end) => {
+  const success = await logData.countDocuments({
+    status: { $in: [200, 304] },
+    "logs.timestamp": { $gte: start, $lt: end },
+  });
 
-    const start = new Date(year, month - 1, 1); // first day of month
-    const end = new Date(year, month, 1); // first day of next month
+  const fail = await logData.countDocuments({
+    status: { $nin: [200, 304] },
+    "logs.timestamp": { $gte: start, $lt: end },
+  });
 
-    // ✅ Success count (200, 304)
-    const success = await logData.countDocuments({
-      status: { $in: [200, 304] },
-      "logs.timestamp": { $gte: start, $lt: end },
-    });
+  const total = await logData.countDocuments({
+    "logs.timestamp": { $gte: start, $lt: end },
+  });
 
-    // ✅ Failure count (anything else)
-    const fail = await logData.countDocuments({
-      status: { $nin: [200, 304] },
-      "logs.timestamp": { $gte: start, $lt: end },
-    });
+  const uptimePercent = total > 0 ? (success / total) * 100 : 0;
+  const errorPercent = total > 0 ? (fail / total) * 100 : 0;
 
-    // ✅ Total logs in that month
-    const total = await logData.countDocuments({
-      "logs.timestamp": { $gte: start, $lt: end },
-    });
-
-    const uptimePercent = total > 0 ? (success / total) * 100 : 0;
-    const errorPercent = total > 0 ? (fail / total) * 100 : 0;
-
-    // ✅ Max repeated 4xx/5xx status
-    const maxErrorStatus = await logData.aggregate([
-      {
-        $match: {
-          status: { $gte: 400, $lt: 600 },
-          "logs.timestamp": { $gte: start, $lt: end },
-        },
-      },
-      {
-        $group: {
-          _id: "$status",
-          count: { $sum: 1 },
-        },
-      },
-      { $sort: { count: -1 } },
-      { $limit: 1 },
-    ]);
-
-    // ✅ Last error log timestamp (4xx/5xx)
-    const lastErrorLog = await logData
-      .findOne({
+  const maxErrorStatus = await logData.aggregate([
+    {
+      $match: {
         status: { $gte: 400, $lt: 600 },
         "logs.timestamp": { $gte: start, $lt: end },
-      })
-      .sort({ "logs.timestamp": -1 });
-
-    const lastTimestamp = lastErrorLog?.logs?.[0]?.timestamp || null;
-
-    // ✅ Total & Average Response Time
-    const timeAgg = await logData.aggregate([
-      {
-        $match: {
-          "logs.timestamp": { $gte: start, $lt: end },
-        },
       },
-      {
-        $group: {
-          _id: null,
-          totalResponseTime: { $sum: "$responseTimeMs" },
-          avgResponseTime: { $avg: "$responseTimeMs" },
-        },
+    },
+    {
+      $group: {
+        _id: "$status",
+        count: { $sum: 1 },
       },
+    },
+    { $sort: { count: -1 } },
+    { $limit: 1 },
+  ]);
+
+  const lastErrorLog = await logData
+    .findOne({
+      status: { $gte: 400, $lt: 600 },
+      "logs.timestamp": { $gte: start, $lt: end },
+    })
+    .sort({ "logs.timestamp": -1 })
+    .lean();
+
+  let lastTimestamp = null;
+  if (lastErrorLog && Array.isArray(lastErrorLog.logs) && lastErrorLog.logs.length) {
+    const candidate = lastErrorLog.logs
+      .map((l) => new Date(l.timestamp))
+      .filter((t) => t >= start && t < end)
+      .sort((a, b) => b - a)[0];
+    lastTimestamp = candidate || null;
+  }
+
+  const timeAgg = await logData.aggregate([
+    {
+      $match: {
+        "logs.timestamp": { $gte: start, $lt: end },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        totalResponseTime: { $sum: "$responseTimeMs" },
+        avgResponseTime: { $avg: "$responseTimeMs" },
+      },
+    },
+  ]);
+
+  const totalResponseTime = timeAgg[0]?.totalResponseTime || 0;
+  const avgResponseTime = timeAgg[0]?.avgResponseTime || 0;
+
+  return {
+    totalRequests: total,
+    success,
+    fail,
+    uptimePercent,
+    errorPercent,
+    maxErrorStatus: maxErrorStatus[0] || null,
+    lastErrorTimestamp: lastTimestamp,
+    totalResponseTime,
+    avgResponseTime,
+  };
+};
+
+export const getAnalysis = async (req, res) => {
+  try {
+    let { year, month } = req.query;
+    const hasYearMonth = !!year && !!month;
+
+    if (hasYearMonth) {
+      year = Number(year);
+      month = Number(month);
+      if (Number.isNaN(year) || Number.isNaN(month)) {
+        return res.status(400).json({ error: "Invalid year or month" });
+      }
+    } else {
+      // If no year/month provided, treat as fallthrough to find latest
+    }
+
+    // Try requested month first (if provided)
+    if (hasYearMonth) {
+      const start = new Date(year, month - 1, 1);
+      const end = new Date(year, month, 1);
+      const c = await countLogsInRange(start, end);
+      if (c > 0) {
+        const analysis = await computeAnalysisForRange(start, end);
+        return res.status(200).json({ ...analysis, year, month, isFallback: false });
+      }
+      // else fall through to find latest month with data
+    }
+
+    // Find latest logs.timestamp across collection
+    const latestAgg = await logData.aggregate([
+      { $unwind: "$logs" },
+      { $sort: { "logs.timestamp": -1 } },
+      { $limit: 1 },
+      { $project: { ts: "$logs.timestamp" } },
     ]);
 
-    const totalResponseTime = timeAgg[0]?.totalResponseTime || 0;
-    const avgResponseTime = timeAgg[0]?.avgResponseTime || 0;
+    if (!latestAgg || latestAgg.length === 0) {
+      // No logs in DB
+      return res.status(200).json({
+        year: null,
+        month: null,
+        isFallback: false,
+        message: "No logs available",
+        totalRequests: 0,
+      });
+    }
 
-    // ✅ Final response
-    res.status(200).json({
-      year,
-      month,
-      totalRequests: total,
-      success,
-      fail,
-      uptimePercent,
-      errorPercent,
-      maxErrorStatus: maxErrorStatus[0] || null,
-      lastErrorTimestamp: lastTimestamp,
-      totalResponseTime,
-      avgResponseTime,
-    });
+    const latestTs = new Date(latestAgg[0].ts);
+    const ly = latestTs.getFullYear();
+    const lm = latestTs.getMonth() + 1;
+    const latestStart = new Date(ly, lm - 1, 1);
+    const latestEnd = new Date(ly, lm, 1);
+
+    const analysis = await computeAnalysisForRange(latestStart, latestEnd);
+    return res.status(200).json({ ...analysis, year: ly, month: lm, isFallback: true });
   } catch (error) {
+    console.error("getAnalysis error:", error);
     res.status(500).json({ status: "error", message: error.message });
   }
 };
 
 export const getUptime = async (req, res) => {
   try {
-    const { year, month } = req.query;
+    let { year, month } = req.query;
+    const hasYearMonth = !!year && !!month;
 
-    if (!year || !month) {
-      return res
-        .status(400)
-        .json({
-          error: "Please provide year and month (e.g. ?year=2025&month=09)",
+    if (hasYearMonth) {
+      year = Number(year);
+      month = Number(month);
+      if (Number.isNaN(year) || Number.isNaN(month)) {
+        return res.status(400).json({ error: "Invalid year or month" });
+      }
+    }
+
+    const computeUptimeFor = async (y, m) => {
+      const start = new Date(y, m - 1, 1);
+      const end = new Date(y, m, 1);
+
+      // quick existence check
+      const totalCount = await countLogsInRange(start, end);
+      if (totalCount === 0) return null;
+
+      const docs = await logData.find({ "logs.timestamp": { $gte: start, $lt: end } }).lean();
+
+      const dayMap = new Map();
+      docs.forEach((doc) => {
+        const relevant = (doc.logs || []).filter((l) => {
+          const t = new Date(l.timestamp);
+          return t >= start && t < end;
         });
-    }
 
-    const start = new Date(year, month-1, 1); // first day of month
-    const end = new Date(year, month, 1); // first day of next month
-
-    // Step 1: Get all logs for that month
-    const logs = await logData
-      .find({
-        "logs.timestamp": { $gte: start, $lt: end },
-      })
-      .lean();
-
-    //console.log(logs)
-
-    // Step 2: Group by day
-    const dayMap = new Map();
-
-    logs.forEach((log) => {
-      const date = new Date(log.logs[0].timestamp);
-      const day = date.getDate(); // 1–31
-
-      if (!dayMap.has(day)) {
-        dayMap.set(day, { total: 0, success: 0 });
-      }
-
-      const entry = dayMap.get(day);
-      entry.total += 1;
-
-      // ✅ success if status is 200 or 304
-      if ([200, 304].includes(log.status)) {
-        entry.success += 1;
-      }
-    });
-
-    //console.log(dayMap)
-
-    const daysInMonth = new Date(year, month, 0).getDate();
-    const filledStats = [];
-
-    for (let d = 1; d <= daysInMonth; d++) {
-      const entry = dayMap.get(d);
-      let uptimePercent = null;
-
-      if (entry) {
-        uptimePercent = (entry.success / entry.total) * 100;
-      }
-
-      filledStats.push({
-        date: new Date(year, month - 1, d ),
-        uptimePercent: uptimePercent ?? 0, // can also return null
+        relevant.forEach((l) => {
+          const day = new Date(l.timestamp).getDate();
+          if (!dayMap.has(day)) dayMap.set(day, { total: 0, success: 0 });
+          const entry = dayMap.get(day);
+          entry.total += 1;
+          if ([200, 304].includes(doc.status)) entry.success += 1;
+        });
       });
+
+      const daysInMonth = new Date(y, m, 0).getDate();
+      const filledStats = [];
+      for (let d = 1; d <= daysInMonth; d++) {
+        const entry = dayMap.get(d);
+        const uptimePercent = entry ? (entry.success / entry.total) * 100 : 0;
+        filledStats.push({
+          date: new Date(y, m - 1, d),
+          uptimePercent,
+        });
+      }
+      return filledStats;
+    };
+
+    // Try requested month first
+    if (hasYearMonth) {
+      const uptimeRes = await computeUptimeFor(year, month);
+      if (uptimeRes) {
+        return res.status(200).json({ data: uptimeRes, year, month, isFallback: false });
+      }
+      // else fall through
     }
-    //console.log(filledStats)
-    res.json(filledStats);
+
+    // Find latest month with logs
+    const latestAgg = await logData.aggregate([
+      { $unwind: "$logs" },
+      { $sort: { "logs.timestamp": -1 } },
+      { $limit: 1 },
+      { $project: { ts: "$logs.timestamp" } },
+    ]);
+
+    if (!latestAgg || latestAgg.length === 0) {
+      return res.status(200).json({ data: [], year: null, month: null, isFallback: false });
+    }
+
+    const latestTs = new Date(latestAgg[0].ts);
+    const ly = latestTs.getFullYear();
+    const lm = latestTs.getMonth() + 1;
+
+    const uptimeRes = await computeUptimeFor(ly, lm);
+    if (!uptimeRes) {
+      return res.status(200).json({ data: [], year: null, month: null, isFallback: false });
+    }
+    return res.status(200).json({ data: uptimeRes, year: ly, month: lm, isFallback: true });
   } catch (err) {
+    console.error("getUptime error:", err);
     res.status(500).json({ error: err.message });
   }
 };
